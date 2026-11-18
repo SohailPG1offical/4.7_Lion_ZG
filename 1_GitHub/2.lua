@@ -811,8 +811,10 @@ local SA_DEFAULTS = {
     AimMode        = 3,    -- 1 = ADS, 2 = hip, 3 = both
     AimTrigger     = 1,    -- 1 = while firing, 2 = always
     AimBone        = 2,    -- 1 = head, 2 = chest, 3 = stomach
-    AimFOV         = 18,   -- percent of half screen width
-    AimSpeed       = 24,   -- 5..100, higher = a little faster
+    AimFOV         = 18,   -- hip FOV, percent of half screen width
+    AimFOVADS      = 14,   -- ADS/scope FOV
+    AimSpeed       = 24,   -- hip smooth speed 5..100
+    AimSpeedADS    = 28,   -- ADS/scope smooth speed 5..100
     AimDistance    = 150,  -- meters
     AimVis         = true,
     AimIgnoreKnock = true,
@@ -848,7 +850,9 @@ local function SA_ClampConfig()
     SA_CFG.AimTrigger     = math.floor(SA_Clamp(SA_CFG.AimTrigger, 1, 2) + 0.5)
     SA_CFG.AimBone        = math.floor(SA_Clamp(SA_CFG.AimBone, 1, 3) + 0.5)
     SA_CFG.AimFOV         = SA_Clamp(SA_CFG.AimFOV, 5, 60)
+    SA_CFG.AimFOVADS      = SA_Clamp(SA_CFG.AimFOVADS, 5, 60)
     SA_CFG.AimSpeed       = SA_Clamp(SA_CFG.AimSpeed, 5, 100)
+    SA_CFG.AimSpeedADS    = SA_Clamp(SA_CFG.AimSpeedADS, 5, 100)
     SA_CFG.AimDistance    = SA_Clamp(SA_CFG.AimDistance, 10, 300)
     SA_CFG.ESPMaxDistance = SA_Clamp(SA_CFG.ESPMaxDistance, 100, 800)
     SA_CFG.IPadFOV        = SA_Clamp(SA_CFG.IPadFOV, 90, 120)
@@ -858,7 +862,7 @@ SA_ClampConfig()
 local function SA_GetConfigCandidates()
     local list = {}
     local seen = {}
-    local function add(base)
+    local function addDir(base)
         if type(base) ~= "string" or base == "" then return end
         local p = base:gsub("/+$", "") .. "/SohailPG1_safe.cfg"
         if not seen[p] then
@@ -869,20 +873,81 @@ local function SA_GetConfigCandidates()
 
     pcall(function()
         if currentGamePaths then
-            add(currentGamePaths.saved)
-            add(currentGamePaths.base)
-            add(currentGamePaths.sdcard)
+            addDir(currentGamePaths.saved)
+            addDir(currentGamePaths.base)
+            addDir(currentGamePaths.sdcard)
         end
     end)
 
-    add("/storage/emulated/0")
-    add("/sdcard")
-    add(".")
+    -- Game-writable UE4 dirs used by working mod configs. Writing to every
+    -- candidate prevents one stale/blocked file from restoring old values.
+    pcall(function()
+        local pkg = tostring(packageName or "")
+        local dataRoots = {}
+        if pkg ~= "" then
+            dataRoots[#dataRoots + 1] = "/storage/emulated/0/Android/data/" .. pkg .. "/files"
+            dataRoots[#dataRoots + 1] = "/sdcard/Android/data/" .. pkg .. "/files"
+        end
+
+        for i = 1, #dataRoots do
+            local root = dataRoots[i]:gsub("/+$", "")
+            local ue = root .. "/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved"
+            addDir(ue .. "/Paks")
+            addDir(ue .. "/SaveGames")
+        end
+
+        addDir("/storage/emulated/0/Documents/ShadowTrackerExtra/Saved/Paks")
+        addDir("/storage/emulated/0/Documents/ShadowTrackerExtra/Saved/Paks/puffer_temp")
+        addDir("/storage/emulated/0/Documents/ShadowTrackerExtra/Saved/SaveGames")
+        addDir("/Documents/ShadowTrackerExtra/Saved/Paks")
+        addDir("/Documents/ShadowTrackerExtra/Saved/Paks/puffer_temp")
+        addDir("ShadowTrackerExtra/Saved/Paks")
+        addDir("ShadowTrackerExtra/Saved/SaveGames")
+        addDir("../../ShadowTrackerExtra/Saved/Paks")
+        addDir("../../ShadowTrackerExtra/Saved/SaveGames")
+        addDir("../../../ShadowTrackerExtra/Saved/Paks")
+        addDir("../../../ShadowTrackerExtra/Saved/SaveGames")
+    end)
+
+    addDir("/storage/emulated/0")
+    addDir("/sdcard")
+    addDir(".")
 
     return list
 end
 
 local SA_ConfigPath = _G.SAConfigPath
+local SA_LastSaveStamp = 0
+
+local function SA_ReadConfigFile(path)
+    local ok, f = pcall(io.open, path, "r")
+    if not ok or not f then return nil end
+
+    local values = {}
+    local stamp = 0
+    local count = 0
+    local okRead = pcall(function()
+        for line in f:lines() do
+            local k, v = line:match("^([%w_]+)=(.*)$")
+            if k == "SavedAt" then
+                local n = tonumber(v)
+                if n then stamp = n end
+            elseif k and SA_DEFAULTS[k] ~= nil then
+                if type(SA_DEFAULTS[k]) == "boolean" then
+                    values[k] = (v == "1" or v == "true")
+                else
+                    local n = tonumber(v)
+                    if n ~= nil then values[k] = n end
+                end
+                count = count + 1
+            end
+        end
+        f:close()
+    end)
+    if not okRead then pcall(function() f:close() end) end
+    if count == 0 then return nil end
+    return values, stamp, count
+end
 
 local function SA_LoadConfig()
     local candidates = SA_GetConfigCandidates()
@@ -894,44 +959,46 @@ local function SA_LoadConfig()
         if not found then table.insert(candidates, 1, SA_ConfigPath) end
     end
 
+    local bestValues, bestPath
+    local bestStamp, bestCount, bestScore = 0, 0, -1
+
     for i = 1, #candidates do
         local path = candidates[i]
-        local ok, f = pcall(io.open, path, "r")
-        if ok and f then
-            local loadedAny = false
-            local okRead = pcall(function()
-                for line in f:lines() do
-                    local k, v = line:match("^([%w_]+)=(.*)$")
-                    if k and SA_DEFAULTS[k] ~= nil then
-                        loadedAny = true
-                        if type(SA_DEFAULTS[k]) == "boolean" then
-                            SA_CFG[k] = (v == "1" or v == "true")
-                        elseif type(SA_DEFAULTS[k]) == "number" then
-                            local n = tonumber(v)
-                            if n ~= nil then SA_CFG[k] = n end
-                        end
-                    end
-                end
-                f:close()
-            end)
-            if not okRead then pcall(function() f:close() end) end
-            if loadedAny then
-                SA_ConfigPath = path
-                _G.SAConfigPath = path
-                break
+        local values, stamp, count = SA_ReadConfigFile(path)
+        if values then
+            -- Newest saved file wins. Key count breaks ties from partial writes.
+            local score = stamp * 10000 + count
+            if score > bestScore then
+                bestValues = values
+                bestPath = path
+                bestStamp = stamp
+                bestCount = count
+                bestScore = score
             end
         end
+    end
+
+    if bestValues then
+        for k, v in pairs(bestValues) do
+            SA_CFG[k] = v
+        end
+        SA_ConfigPath = bestPath
+        SA_LastSaveStamp = bestStamp
+        _G.SAConfigPath = bestPath
+        _G.SAConfigSavedAt = bestStamp
+        _G.SAConfigLoadedKeys = bestCount
     end
 
     SA_ClampConfig()
 end
 
-local function SA_WriteConfigTo(path)
+local function SA_WriteConfigTo(path, stamp)
     local ok, f = pcall(io.open, path, "w")
     if not ok or not f then return false end
 
     local wrote = false
     local okWrite = pcall(function()
+        f:write("SavedAt=" .. tostring(stamp) .. "\n")
         for k, def in pairs(SA_DEFAULTS) do
             local v = SA_CFG[k]
             if type(def) == "boolean" then
@@ -951,28 +1018,36 @@ end
 local function SA_SaveConfig(force)
     if not force and not SA_State.Dirty then return end
 
-    local saved = false
+    local stamp = (os.time and os.time()) or 0
+    if stamp <= SA_LastSaveStamp then stamp = SA_LastSaveStamp + 1 end
+    SA_LastSaveStamp = stamp
+
+    local candidates = SA_GetConfigCandidates()
     if SA_ConfigPath then
-        saved = SA_WriteConfigTo(SA_ConfigPath)
+        local found = false
+        for i = 1, #candidates do
+            if candidates[i] == SA_ConfigPath then found = true break end
+        end
+        if not found then table.insert(candidates, 1, SA_ConfigPath) end
     end
 
-    if not saved then
-        local candidates = SA_GetConfigCandidates()
-        for i = 1, #candidates do
-            if SA_WriteConfigTo(candidates[i]) then
-                SA_ConfigPath = candidates[i]
-                _G.SAConfigPath = candidates[i]
-                saved = true
-                break
-            end
+    local firstSaved = nil
+    for i = 1, #candidates do
+        if SA_WriteConfigTo(candidates[i], stamp) and not firstSaved then
+            firstSaved = candidates[i]
         end
     end
 
-    if saved then
+    if firstSaved then
+        SA_ConfigPath = firstSaved
+        SA_LastSaveStamp = stamp
         SA_State.Dirty = false
         SA_State.LastSave = os.clock()
+        _G.SAConfigPath = firstSaved
+        _G.SAConfigSavedAt = stamp
+        return true
     end
-    return saved
+    return false
 end
 
 local function SA_MarkDirty()
@@ -1434,7 +1509,8 @@ local function SA_AimOnce()
 
     local myTeam = SA_GetTeam(player)
     local maxWorldDist = cfg.AimDistance * 100
-    local fovPixels = (cfg.AimFOV / 100.0) * (viewport.X * 0.5)
+    local fovValue = ads and (cfg.AimFOVADS or cfg.AimFOV) or cfg.AimFOV
+    local fovPixels = (fovValue / 100.0) * (viewport.X * 0.5)
     local fovPixelsSq = fovPixels * fovPixels
 
     local bestEnemy, bestPos, bestScreen, bestScore = nil, nil, nil, 999999999
@@ -1532,7 +1608,7 @@ local function SA_AimOnce()
         return
     end
 
-    local speed = SA_Clamp(cfg.AimSpeed, 5, 100)
+    local speed = SA_Clamp(ads and (cfg.AimSpeedADS or cfg.AimSpeed) or cfg.AimSpeed, 5, 100)
     local response = 1.25 + speed * 0.115
     if ads and firing then
         response = response + 1.4
@@ -2119,7 +2195,9 @@ end
 
 local function SA_MenuToggle(key)
     return function(_, v)
-        SA_CFG[key] = v and true or false
+        local value = v and true or false
+        if SA_CFG[key] == value then return true end
+        SA_CFG[key] = value
         SA_MarkDirty()
         pcall(SA_SaveConfig, true)
         return true
@@ -2131,6 +2209,7 @@ local function SA_MenuNumber(key, minv, maxv)
         local n = math.floor((tonumber(v) or minv) + 0.5)
         if n < minv then n = minv end
         if n > maxv then n = maxv end
+        if SA_CFG[key] == n then return true end
         SA_CFG[key] = n
         SA_MarkDirty()
         pcall(SA_SaveConfig, true)
@@ -2180,10 +2259,14 @@ function _G.SA_InitMenu()
                   GetFunc = function() return SA_CFG.AimTrigger end, SetFunc = SA_MenuNumber("AimTrigger", 1, 2) },
                 { Key = "SA_Aim_Bone", UI = AliasMap.Slider, Text = "  TARGET 1=HEAD 2=CHEST 3=STOMACH", ExpandHandle = "SA_Aim_Enable", MinValue = 1, MaxValue = 3, min = 1, max = 3,
                   GetFunc = function() return SA_CFG.AimBone end, SetFunc = SA_MenuNumber("AimBone", 1, 3) },
-                { Key = "SA_Aim_FOV", UI = AliasMap.Slider, Text = "  FOV 5-60 (SMALL IS SAFER)", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 60, min = 5, max = 60,
+                { Key = "SA_Aim_FOV", UI = AliasMap.Slider, Text = "  HIP FOV 5-60 (SMALL IS SAFER)", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 60, min = 5, max = 60,
                   GetFunc = function() return math.floor(SA_CFG.AimFOV + 0.5) end, SetFunc = SA_MenuNumber("AimFOV", 5, 60) },
-                { Key = "SA_Aim_Speed", UI = AliasMap.Slider, Text = "  SMOOTH SPEED 5-100", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 100, min = 5, max = 100,
+                { Key = "SA_Aim_FOV_ADS", UI = AliasMap.Slider, Text = "  SCOPE/ADS FOV 5-60", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 60, min = 5, max = 60,
+                  GetFunc = function() return math.floor((SA_CFG.AimFOVADS or SA_CFG.AimFOV) + 0.5) end, SetFunc = SA_MenuNumber("AimFOVADS", 5, 60) },
+                { Key = "SA_Aim_Speed", UI = AliasMap.Slider, Text = "  HIP SMOOTH SPEED 5-100", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 100, min = 5, max = 100,
                   GetFunc = function() return math.floor(SA_CFG.AimSpeed + 0.5) end, SetFunc = SA_MenuNumber("AimSpeed", 5, 100) },
+                { Key = "SA_Aim_Speed_ADS", UI = AliasMap.Slider, Text = "  SCOPE/ADS SPEED 5-100", ExpandHandle = "SA_Aim_Enable", MinValue = 5, MaxValue = 100, min = 5, max = 100,
+                  GetFunc = function() return math.floor((SA_CFG.AimSpeedADS or SA_CFG.AimSpeed) + 0.5) end, SetFunc = SA_MenuNumber("AimSpeedADS", 5, 100) },
                 { Key = "SA_Aim_Dist", UI = AliasMap.Slider, Text = "  MAX DISTANCE 10-300M", ExpandHandle = "SA_Aim_Enable", MinValue = 10, MaxValue = 300, min = 10, max = 300,
                   GetFunc = function() return math.floor(SA_CFG.AimDistance + 0.5) end, SetFunc = SA_MenuNumber("AimDistance", 10, 300) },
                 { Key = "SA_Aim_Vis", UI = AliasMap.Switcher, Text = "  VISIBILITY CHECK", ExpandHandle = "SA_Aim_Enable",
