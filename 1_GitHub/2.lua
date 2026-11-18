@@ -855,41 +855,83 @@ local function SA_ClampConfig()
 end
 SA_ClampConfig()
 
-local SA_ConfigPath = nil
-pcall(function()
-    if currentGamePaths and currentGamePaths.saved then
-        local base = tostring(currentGamePaths.saved):gsub("/+$", "")
-        SA_ConfigPath = base .. "/SohailPG1_safe.cfg"
+local function SA_GetConfigCandidates()
+    local list = {}
+    local seen = {}
+    local function add(base)
+        if type(base) ~= "string" or base == "" then return end
+        local p = base:gsub("/+$", "") .. "/SohailPG1_safe.cfg"
+        if not seen[p] then
+            seen[p] = true
+            list[#list + 1] = p
+        end
     end
-end)
+
+    pcall(function()
+        if currentGamePaths then
+            add(currentGamePaths.saved)
+            add(currentGamePaths.base)
+            add(currentGamePaths.sdcard)
+        end
+    end)
+
+    add("/storage/emulated/0")
+    add("/sdcard")
+    add(".")
+
+    return list
+end
+
+local SA_ConfigPath = _G.SAConfigPath
 
 local function SA_LoadConfig()
-    if not SA_ConfigPath then return end
-    local ok, f = pcall(io.open, SA_ConfigPath, "r")
-    if not ok or not f then return end
-    pcall(function()
-        for line in f:lines() do
-            local k, v = line:match("^([%w_]+)=(.*)$")
-            if k and SA_DEFAULTS[k] ~= nil then
-                if type(SA_DEFAULTS[k]) == "boolean" then
-                    SA_CFG[k] = (v == "1" or v == "true")
-                elseif type(SA_DEFAULTS[k]) == "number" then
-                    local n = tonumber(v)
-                    if n then SA_CFG[k] = n end
+    local candidates = SA_GetConfigCandidates()
+    if SA_ConfigPath then
+        local found = false
+        for i = 1, #candidates do
+            if candidates[i] == SA_ConfigPath then found = true break end
+        end
+        if not found then table.insert(candidates, 1, SA_ConfigPath) end
+    end
+
+    for i = 1, #candidates do
+        local path = candidates[i]
+        local ok, f = pcall(io.open, path, "r")
+        if ok and f then
+            local loadedAny = false
+            local okRead = pcall(function()
+                for line in f:lines() do
+                    local k, v = line:match("^([%w_]+)=(.*)$")
+                    if k and SA_DEFAULTS[k] ~= nil then
+                        loadedAny = true
+                        if type(SA_DEFAULTS[k]) == "boolean" then
+                            SA_CFG[k] = (v == "1" or v == "true")
+                        elseif type(SA_DEFAULTS[k]) == "number" then
+                            local n = tonumber(v)
+                            if n ~= nil then SA_CFG[k] = n end
+                        end
+                    end
                 end
+                f:close()
+            end)
+            if not okRead then pcall(function() f:close() end) end
+            if loadedAny then
+                SA_ConfigPath = path
+                _G.SAConfigPath = path
+                break
             end
         end
-        f:close()
-    end)
+    end
+
     SA_ClampConfig()
 end
 
-local function SA_SaveConfig(force)
-    if not SA_ConfigPath then return end
-    if not force and not SA_State.Dirty then return end
-    local ok, f = pcall(io.open, SA_ConfigPath, "w")
-    if not ok or not f then return end
-    pcall(function()
+local function SA_WriteConfigTo(path)
+    local ok, f = pcall(io.open, path, "w")
+    if not ok or not f then return false end
+
+    local wrote = false
+    local okWrite = pcall(function()
         for k, def in pairs(SA_DEFAULTS) do
             local v = SA_CFG[k]
             if type(def) == "boolean" then
@@ -900,9 +942,37 @@ local function SA_SaveConfig(force)
             f:write(k .. "=" .. v .. "\n")
         end
         f:close()
+        wrote = true
     end)
-    SA_State.Dirty = false
-    SA_State.LastSave = os.clock()
+    if not okWrite then pcall(function() f:close() end) end
+    return wrote
+end
+
+local function SA_SaveConfig(force)
+    if not force and not SA_State.Dirty then return end
+
+    local saved = false
+    if SA_ConfigPath then
+        saved = SA_WriteConfigTo(SA_ConfigPath)
+    end
+
+    if not saved then
+        local candidates = SA_GetConfigCandidates()
+        for i = 1, #candidates do
+            if SA_WriteConfigTo(candidates[i]) then
+                SA_ConfigPath = candidates[i]
+                _G.SAConfigPath = candidates[i]
+                saved = true
+                break
+            end
+        end
+    end
+
+    if saved then
+        SA_State.Dirty = false
+        SA_State.LastSave = os.clock()
+    end
+    return saved
 end
 
 local function SA_MarkDirty()
