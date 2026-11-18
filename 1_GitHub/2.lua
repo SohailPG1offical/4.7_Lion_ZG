@@ -791,6 +791,7 @@ local SA_State = {
     LastMarkTry  = 0,
     ReportPatched = false,
     Dirty        = false,
+    SprayTime    = 0,
     Viewport     = nil,
     Enemies      = {},
     EnemyOwner   = nil,
@@ -1346,6 +1347,10 @@ local function SA_AimOnce()
         ads = player.bIsGunADS == true or player.bIsWeaponAiming == true
     end)
 
+    if not (firing and ads) then
+        SA_State.SprayTime = 0
+    end
+
     if cfg.AimMode == 1 and not ads then return end
     if cfg.AimMode == 2 and ads then return end
     if cfg.AimTrigger == 1 and not firing then return end
@@ -1427,32 +1432,51 @@ local function SA_AimOnce()
     pcall(function() current = pc:GetControlRotation() end)
     if not current then return end
 
-    local dYaw = look.Yaw - current.Yaw
-    local dPitch = look.Pitch - current.Pitch
-    if dYaw > 180 then dYaw = dYaw - 360 elseif dYaw < -180 then dYaw = dYaw + 360 end
-    if dPitch > 180 then dPitch = dPitch - 360 elseif dPitch < -180 then dPitch = dPitch + 360 end
-
-    if ads and camRot then
-        dYaw = dYaw - (camRot.Yaw - current.Yaw)
-        dPitch = dPitch - (camRot.Pitch - current.Pitch)
-    end
-
-    if math.abs(dYaw) < 0.22 and math.abs(dPitch) < 0.22 then return end
-
     local now = os.clock()
     local dt = now - (SA_State.LastAim or now)
     SA_State.LastAim = now
     if dt <= 0 or dt > 0.08 then dt = 0.02 end
 
+    if firing and ads then
+        SA_State.SprayTime = (SA_State.SprayTime or 0) + dt
+    else
+        SA_State.SprayTime = 0
+    end
+
+    -- Scoped long-spray compensation: counter recoil rise (bullets going above head)
+    if ads and firing and (SA_State.SprayTime or 0) > 0.10 then
+        local t = SA_State.SprayTime - 0.10
+        local extraDown = math.min(t * 2.5, 3.5)
+        if (cfg.AimBone or 2) == 1 then
+            extraDown = extraDown + math.min(t * 0.8, 1.2)
+        end
+        look.Pitch = look.Pitch - extraDown
+    end
+
+    local dYaw = look.Yaw - current.Yaw
+    local dPitch = look.Pitch - current.Pitch
+    if dYaw > 180 then dYaw = dYaw - 360 elseif dYaw < -180 then dYaw = dYaw + 360 end
+    if dPitch > 180 then dPitch = dPitch - 360 elseif dPitch < -180 then dPitch = dPitch + 360 end
+
+    if math.abs(dYaw) < 0.08 and math.abs(dPitch) < 0.08 and (SA_State.SprayTime or 0) < 0.10 then
+        return
+    end
+
     local speed = SA_Clamp(cfg.AimSpeed, 5, 100)
     local response = 1.25 + speed * 0.115
+    if ads and firing then
+        response = response + 1.4
+    end
     local alpha = 1.0 - math.exp(-response * dt)
     if alpha < 0.015 then alpha = 0.015 end
-    if alpha > 0.32 then alpha = 0.32 end
+    if alpha > 0.38 then alpha = 0.38 end
 
     local stepYaw = dYaw * alpha
     local stepPitch = dPitch * alpha
     local maxStep = 0.75 + speed * 0.045
+    if ads and firing then
+        maxStep = maxStep + 0.7
+    end
     local mag = math.sqrt(stepYaw * stepYaw + stepPitch * stepPitch)
     if mag > maxStep and mag > 0 then
         local scale = maxStep / mag
@@ -2027,6 +2051,7 @@ local function SA_MenuToggle(key)
     return function(_, v)
         SA_CFG[key] = v and true or false
         SA_MarkDirty()
+        pcall(SA_SaveConfig, true)
         return true
     end
 end
@@ -2038,6 +2063,7 @@ local function SA_MenuNumber(key, minv, maxv)
         if n > maxv then n = maxv end
         SA_CFG[key] = n
         SA_MarkDirty()
+        pcall(SA_SaveConfig, true)
         return true
     end
 end
@@ -2241,8 +2267,11 @@ if SA_Expired then
         end
     end)
 else
-    -- Load saved settings only once for this file.
-    SA_LoadConfig()
+    -- Load saved settings only once per runtime/session to avoid reverting unsaved changes on reload.
+    if not _G.SAConfigLoadedFromDisk then
+        SA_LoadConfig()
+        _G.SAConfigLoadedFromDisk = true
+    end
 
     pcall(function()
         if _G.SALoopsStarted then return end
